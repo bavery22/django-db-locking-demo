@@ -1,0 +1,121 @@
+# DB locking demo
+
+Project to demonstrate issues with db locking when Django apps run
+alongside a script which also accesses the same SQLite database via
+Django ORM.
+
+In this setup, we have a site which provides an HTTP API to insert
+database records via Django ORM; and we run a separate standalone app
+from the command line, which also bootstraps Django and uses its ORM
+to insert db records.
+
+# Comparison with Toaster
+
+This demo mirrors what we're doing in Toaster, but on a much smaller scale.
+However, the number of inserts Toaster does (around 15,000,
+performed instantaneously without queuing) is comparable to the number
+of inserts done in this test case.
+
+Also, in Toaster, we actually have three processes accessing the
+database simultaneously: runbuilds, buildinfohelper, and the web UI.
+So our situation is in some ways worse than this test case.
+
+Note that both the app and the external process insert records into
+the same table, which is a further source of contention. But it's worth
+pointing out that SQLite doesn't have table-level locking anyway,
+so the fact both processes are accessing the same table is irrelevant
+(the whole database locks, regardless of whether you're writing to
+one table or several: https://www.sqlite.org/lockingv3.html).
+
+However, note that we do write to one table from two processes in
+Toaster, as we write to the BuildRequest table from both buildinfohelper
+and the web UI.
+
+One final point is that the db locking issue isn't caused by upgrading to
+Django 1.8, but is a consequence of our architecture. (I have reproduced
+this on Django 1.7.11 with the same code.) We have just
+been lucky so far that the load we're placing on the database hasn't
+caused this issue before.
+
+My hunch is that something changed in Django 1.8 to make the database
+transactions safer and better managed, and consequently slightly
+slower; this has then caused the database locking issue we're seeing to
+surface. But it was there all along, just waiting to pounce.
+
+# Reproducing the db locking issue
+
+1.  Run ./test-run.sh. This migrates the db and starts the Django server.
+
+    You can invoke it as follows to turn on ATOMIC_REQUESTS
+    (https://docs.djangoproject.com/en/1.8/topics/db/transactions/#tying-transactions-to-http-requests),
+    to see whether that has an effect:
+
+        ATOMIC_REQUESTS=True ./test-run.sh
+
+    Note that this does seem to improve things, but doesn't stop the error
+    happening eventually.
+
+    You can also modify the TIMEOUT setting (in seconds) to increase the
+    SQLite timeout before the database file is locked:
+
+        TIMEOUT=10 ./test-run.sh
+
+    Note that this may delay when the error happens, but it will probably
+    still eventually happen.
+
+    Finally, you can change the SQLite db to use WAL journal mode, which is
+    a more efficient mode available in SQLite 3.7+
+    (see https://www.sqlite.org/wal.html):
+
+        WAL=True ./test-run.sh
+
+    This also seems to slow down the inevitable, but it eventually happens
+    anyway.
+
+    NB Any of the above env variables can be passed together.
+
+2.  In a different terminal, run
+
+        ./test-external-load.sh
+
+    This starts inserting records in the database via Django ORM, with no delay
+    between inserts. You can pass a float as the delay in seconds to put
+    between inserts, e.g.
+
+        ./test-external-load.sh 0.5
+
+3.  In yet another terminal, run
+
+        ./test-http-load.sh
+
+    This inserts records into the database via the Django ORM, but
+    by invoking a view inside the app.
+
+    You can modify the SLEEP and NUM variables in the script to
+    adjust the pause between inserts and the number of inserts per request
+    respectively.
+
+The scripts are fairly simple, so you can easily fiddle around with
+them if you want to try slower inserts, want to insert more
+records per second etc.
+
+On my setup, I very quickly see an error like this:
+
+    <tr>
+      <th>Exception Type:</th>
+      <td>OperationalError</td>
+    </tr>
+
+
+    <tr>
+      <th>Exception Value:</th>
+      <td><pre>database is locked</pre></td>
+    </tr>
+
+i.e. the SQLite database has locked. Typically, it's the HTTP process
+which can't access the site and gets a 500 error; the back-end process
+seems to continue OK in most cases.
+
+On faster machines, it may be hard to reproduce this error, or it
+may happen less frequently; but by increasing the load, you can probably
+force it to happen.
